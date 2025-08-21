@@ -1,4 +1,4 @@
-package main
+package getRSS
 
 import (
 	"encoding/json"
@@ -65,7 +65,7 @@ func getRSSFeed(url string) (*RSS, error) {
 
 func main() {
 	rssURL := "https://andna.dev/rss.xml"
-	
+
 	rss, err := getRSSFeed(rssURL)
 	if err != nil {
 		response := Response{
