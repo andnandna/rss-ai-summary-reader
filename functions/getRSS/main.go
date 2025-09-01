@@ -1,103 +1,163 @@
-package getRSS
+package main
 
 import (
-	"encoding/json"
-	"encoding/xml"
 	"fmt"
-	"io"
-	"net/http"
+	"log"
+	"os"
+	"path/filepath"
 	"time"
+
+	"github.com/joho/godotenv"
+	"github.com/mmcdole/gofeed"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
 )
 
-type RSS struct {
-	XMLName xml.Name `xml:"rss"`
-	Channel Channel  `xml:"channel"`
+type RssUrl struct {
+	ID          int       `json:"id" gorm:"primaryKey"`
+	RssUrl      string    `json:"url" gorm:"column:rss_url"`
+	IsSummarize bool      `json:"is_active" gorm:"column:is_summarize"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
-type Channel struct {
-	Title       string `xml:"title"`
-	Link        string `xml:"link"`
-	Description string `xml:"description"`
-	Items       []Item `xml:"item"`
+func (RssUrl) TableName() string {
+	return "rss_urls"
 }
 
-type Item struct {
-	Title       string `xml:"title"`
-	Link        string `xml:"link"`
-	Description string `xml:"description"`
-	PubDate     string `xml:"pubDate"`
-	GUID        string `xml:"guid"`
-}
-
-type Response struct {
-	Success bool        `json:"success"`
-	Data    interface{} `json:"data,omitempty"`
-	Error   string      `json:"error,omitempty"`
-}
-
-func getRSSFeed(url string) (*RSS, error) {
-	client := &http.Client{
-		Timeout: 10 * time.Second,
+func connectDB() (*gorm.DB, error) {
+	dbURL := os.Getenv("DB_URL")
+	if dbURL == "" {
+		return nil, fmt.Errorf("DB_URL environment variable is not set")
 	}
 
-	resp, err := client.Get(url)
+	db, err := gorm.Open(postgres.Open(dbURL), &gorm.Config{})
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch RSS feed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		return nil, fmt.Errorf("failed to open database connection: %w", err)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	return db, nil
+}
+
+func fetchRssURLs(db *gorm.DB) ([]RssUrl, error) {
+	var feeds []RssUrl
+	result := db.Find(&feeds)
+	if result.Error != nil {
+		return nil, fmt.Errorf("failed to fetch RSS feeds: %w", result.Error)
+	}
+	return feeds, nil
+}
+
+type Article struct {
+	RssId       int       `json:"rss_id"`
+	Title       string    `json:"title"`
+	Link        string    `json:"link"`
+	Description string    `json:"description"`
+	PublishedAt time.Time `json:"published"`
+}
+
+func (Article) TableName() string {
+	return "articles"
+}
+
+func saveArticles(db *gorm.DB, articles []Article) error {
+	for _, rssGroup := range groupArticlesByRssId(articles) {
+		// 各RSS IDごとに最新の記事の公開日を取得
+		var latestArticle Article
+		result := db.Where("rss_id = ?", rssGroup[0].RssId).
+			Order("published_at DESC").
+			First(&latestArticle)
+
+		var articlesToSave []Article
+		for _, article := range rssGroup {
+			// 最新の記事の公開日以降の記事のみ保存
+			if result.Error == gorm.ErrRecordNotFound || article.PublishedAt.After(latestArticle.PublishedAt) {
+				articlesToSave = append(articlesToSave, article)
+			}
+		}
+
+		// 新しい記事を一括保存
+		if len(articlesToSave) > 0 {
+			if err := db.Create(&articlesToSave).Error; err != nil {
+				return fmt.Errorf("failed to save articles for RSS ID %d: %w", rssGroup[0].RssId, err)
+			}
+		}
+	}
+	return nil
+}
+
+func groupArticlesByRssId(articles []Article) map[int][]Article {
+	grouped := make(map[int][]Article)
+	for _, article := range articles {
+		grouped[article.RssId] = append(grouped[article.RssId], article)
+	}
+	return grouped
+}
+
+func fetchArticlesFromRSS(feed RssUrl) ([]Article, error) {
+	fp := gofeed.NewParser()
+	parsedFeed, err := fp.ParseURL(feed.RssUrl)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
+		return nil, fmt.Errorf("failed to parse RSS feed %s: %w", feed.RssUrl, err)
 	}
 
-	var rss RSS
-	if err := xml.Unmarshal(body, &rss); err != nil {
-		return nil, fmt.Errorf("failed to parse RSS XML: %w", err)
+	var articles []Article
+	for _, item := range parsedFeed.Items {
+		published := time.Now()
+		if item.PublishedParsed != nil {
+			published = *item.PublishedParsed
+		}
+
+		article := Article{
+			RssId:       feed.ID,
+			Title:       item.Title,
+			Link:        item.Link,
+			Description: item.Description,
+			PublishedAt: published,
+		}
+		articles = append(articles, article)
 	}
 
-	return &rss, nil
+	return articles, nil
 }
 
 func main() {
-	rssURL := "https://andna.dev/rss.xml"
+	envPath := filepath.Join("..", "..", ".env")
+	if err := godotenv.Load(envPath); err != nil {
+		log.Printf("Warning: Could not load .env file from %s: %v", envPath, err)
+	}
 
-	rss, err := getRSSFeed(rssURL)
+	db, err := connectDB()
 	if err != nil {
-		response := Response{
-			Success: false,
-			Error:   err.Error(),
-		}
-		jsonBytes, _ := json.Marshal(response)
-		fmt.Println(string(jsonBytes))
+		log.Printf("データベース接続エラー: %v", err)
 		return
 	}
 
-	response := Response{
-		Success: true,
-		Data: map[string]interface{}{
-			"title":       rss.Channel.Title,
-			"link":        rss.Channel.Link,
-			"description": rss.Channel.Description,
-			"itemCount":   len(rss.Channel.Items),
-			"items":       rss.Channel.Items,
-		},
-	}
-
-	jsonBytes, err := json.MarshalIndent(response, "", "  ")
+	feeds, err := fetchRssURLs(db)
 	if err != nil {
-		errorResponse := Response{
-			Success: false,
-			Error:   fmt.Sprintf("failed to marshal response: %v", err),
-		}
-		errorBytes, _ := json.Marshal(errorResponse)
-		fmt.Println(string(errorBytes))
+		log.Printf("RSSフィード取得エラー: %v", err)
 		return
 	}
 
-	fmt.Println(string(jsonBytes))
+	if len(feeds) == 0 {
+		log.Println("アクティブなRSSフィードが見つかりませんでした")
+		return
+	}
+
+	var allArticles []Article
+	for _, feed := range feeds {
+		articles, err := fetchArticlesFromRSS(feed)
+		if err != nil {
+			log.Printf("Warning: %sからの記事取得に失敗: %v", feed.RssUrl, err)
+			continue
+		}
+		allArticles = append(allArticles, articles...)
+	}
+
+	// 記事を保存
+	if err := saveArticles(db, allArticles); err != nil {
+		log.Printf("記事の保存に失敗: %v", err)
+		return
+	}
+
+	log.Printf("合計 %d 件の新しい記事を正常に保存しました", len(allArticles))
 }
